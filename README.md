@@ -26,10 +26,3 @@ Rscript data/generate_synthetic_data.R
 
 ## Non-technical summary
 See `report/non_technical_summary.md` for a plain-language explanation of findings and recommendations.
-
----
-
-If you want, I can:
-- Knit the Rmd files to HTML and add the HTML outputs to the repo,
-- Tweak model hyperparameters further or add cross-validated hyperparameter search,
-- Prepare a short portfolio README blurb you can paste into your GitHub profile.
