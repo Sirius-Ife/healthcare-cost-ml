@@ -1,0 +1,21 @@
+# R / RStudio
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.Rproj
+.Rmd.cache
+
+# Data outputs
+data_raw/*.csv
+*.rds
+
+# Notebook outputs / figures
+*.html
+*.pdf
+*.png
+*.jpeg
+*.svg
+
+# Misc
+.DS_Store

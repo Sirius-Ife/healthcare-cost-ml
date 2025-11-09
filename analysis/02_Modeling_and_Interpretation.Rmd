@@ -1,0 +1,392 @@
+
+---
+title: "02 - Modeling & Interpretation"
+author: "Ife Abe"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width=8, fig.height=5)
+
+library(tidyverse)
+library(rsample)
+library(recipes)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(glmnet)
+library(yardstick)
+library(vip)
+library(fastshap)
+library(DALEX)
+library(tibble)
+library(knitr)
+
+source("C:/Users/sirius_ife/Documents/GitHub/healthcare-cost-ml/scripts/utils.R")
+source("C:/Users/sirius_ife/Documents/GitHub/healthcare-cost-ml/scripts/modeling_helpers.R")
+
+set.seed(123)
+
+```
+
+# Overview
+
+In this notebook I train and compare models to:
+
+1. Predict exact future cost (regression).
+2. Flag members in the top 10% of costs (classification).
+
+I train a regularized linear model (glmnet), a Random Forest, and XGBoost for regression. For classification I use Random Forest (probabilities) and a simple XGBoost classifier. I emphasize interpretability (variable importance, SHAP-style explanations) and clear, plain-language conclusions.
+
+# Load preprocessed data and split
+
+```{r}
+
+data_fe <- read_csv("C:/Users/sirius_ife/Documents/GitHub/healthcare-cost-ml/data/data_raw/synthetic_health_data_fe.csv", col_types = cols())
+data_fe <- data_fe %>% mutate_if(is.character, as.factor)
+set.seed(123)
+split <- initial_split(data_fe, prop = 0.75, strata = high_cost_flag)
+train <- training(split)
+test  <- testing(split)
+
+nrow(train); nrow(test)
+
+```
+
+# Preprocessing recipe
+
+I build a recipe for modeling that:
+- Removes IDs,
+- Creates dummy variables for categorical fields,
+- Normalizes numeric predictors (useful for glmnet).
+
+```{r}
+
+# Preprocessing recipe
+
+rec <- recipe(next_period_cost ~ ., data = train) %>%  
+  step_rm(member_id, employer_id, high_cost_flag) %>%   
+  step_other(all_nominal(), threshold = 0.01) %>%       
+  step_mutate(log_prev_cost = log1p(prev_year_cost)) %>% 
+  step_normalize(all_numeric(), -all_outcomes()) %>%    
+  step_dummy(all_nominal(), one_hot = TRUE)            
+
+# Prep and bake
+
+rec_prep <- prep(rec, training = train)
+x_train <- bake(rec_prep, new_data = train)
+x_test  <- bake(rec_prep, new_data = test)
+
+y_train_reg <- train$next_period_cost
+y_test_reg  <- test$next_period_cost
+
+
+```
+
+# Regression modeling
+
+## 1) Glmnet (regularized linear regression)
+
+```{r}
+
+x_train_mat <- model.matrix(next_period_cost ~ . -1, x_train)
+x_test_mat  <- model.matrix(next_period_cost ~ . -1, x_test)
+
+cv_glm <- glmnet::cv.glmnet(x_train_mat, y_train_reg, alpha = 0.5, nfolds = 5)
+glmnet_mod <- glmnet::glmnet(x_train_mat, y_train_reg, alpha = 0.5, lambda = cv_glm$lambda.min)
+
+pred_glm <- as.numeric(predict(glmnet_mod, newx = x_test_mat))
+regression_metrics(y_test_reg, pred_glm)
+
+```
+
+I used elastic-net (alpha=0.5) to allow both L1 and L2 regularization to handle correlated predictors and avoid overfitting.
+
+## 2) Random Forest
+
+```{r}
+
+rf_mod <- randomForest::randomForest(next_period_cost ~ . - member_id - employer_id - high_cost_flag, data = train, ntree = 300, importance = TRUE)
+pred_rf <- predict(rf_mod, newdata = test)
+regression_metrics(y_test_reg, pred_rf)
+
+```
+
+Random forests often handle skew and interactions well.
+
+## 3) XGBoost (simple setup)
+
+```{r}
+
+# Convert to DMatrix
+
+dtrain <- xgboost::xgb.DMatrix(
+  data = as.matrix(x_train %>% select(-next_period_cost)),
+  label = y_train_reg
+)
+
+dtest <- xgboost::xgb.DMatrix(
+  data = as.matrix(x_test %>% select(-next_period_cost)),
+  label = y_test_reg
+)
+
+params <- list(
+  objective = "reg:squarederror", # regression
+  eval_metric = "rmse",           # root mean squared error
+  eta = 0.05,                     # learning rate
+  max_depth = 6
+)
+
+xgb_mod <- xgboost::xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 300,
+  watchlist = list(train = dtrain, eval = dtest),
+  early_stopping_rounds = 20, # stop if no improvement for 20 rounds
+  verbose = 1
+)
+
+# Predictions
+
+pred_xgb <- predict(xgb_mod, dtest)
+
+# Evaluate
+
+regression_metrics(y_test_reg, pred_xgb)
+
+
+```
+
+## Compare models (table)
+
+```{r}
+
+results_reg <- tibble(
+  model = c("glmnet","random_forest","xgboost"),
+  RMSE  = c(rmse_vec(y_test_reg, pred_glm), rmse_vec(y_test_reg, pred_rf), rmse_vec(y_test_reg, pred_xgb)),
+  MAE   = c(mae_vec(y_test_reg, pred_glm), mae_vec(y_test_reg, pred_rf), mae_vec(y_test_reg, pred_xgb)),
+  R2    = c(rsq_vec(y_test_reg, pred_glm), rsq_vec(y_test_reg, pred_rf), rsq_vec(y_test_reg, pred_xgb))
+)
+
+knitr::kable(results_reg, digits = 2)
+
+```
+
+**Plain language summary:** The tree-based models (random forest and XGBoost) typically outperform the linear (glmnet) model because they capture non-linear behavior and handle the skew/tail of cost better.
+
+# Variable importance (regression)
+
+I plot variable importance for the Random Forest (built-in) and XGBoost (vip).
+
+```{r}
+
+# RF importance
+
+rf_imp <- importance(rf_mod)
+rf_imp_df <- tibble(feature = rownames(rf_imp), IncMSE = rf_imp[, "%IncMSE"]) %>%
+  arrange(desc(IncMSE))
+
+ggplot(dplyr::slice(rf_imp_df, 1:15), aes(reorder(feature, IncMSE), IncMSE)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Random Forest: Top 15 important features (inc. MSE)",
+    x = "",
+    y = "%IncMSE"
+  ) +
+  theme_minimal()
+
+# XGBoost importance via vip
+
+vip::vip(xgb_mod, num_features = 15, geom = "col") + ggtitle("XGBoost: Top 15 features")
+
+```
+
+**Plain language:** Prev-year cost, previous visits, chronic indicators, and number of prescriptions are among the most important predictors.
+
+# SHAP-like explanations (global and local)
+
+I compute approximate SHAP values with `fastshap` for the XGBoost model to get feature impact.
+
+```{r}
+
+# Prepare training data for SHAP
+
+X_train_for_shap <- as.data.frame(as.matrix(x_train %>% select(-next_period_cost)))
+
+# Define prediction wrapper for XGBoost
+
+pred_fun <- function(object, newdata) {
+  predict(object, as.matrix(newdata))
+}
+
+# Compute approximate SHAP values 
+
+shap_vals <- fastshap::explain(
+  object = xgb_mod,
+  X = X_train_for_shap,
+  pred_wrapper = pred_fun,
+  nsim = 50
+)
+
+# Summarize mean absolute SHAP per feature
+
+shap_imp <- apply(abs(shap_vals), 2, mean) %>%
+  as_tibble() %>%
+  rownames_to_column("feature") %>%
+  rename(mean_abs_shap = value) %>%
+  arrange(desc(mean_abs_shap))
+
+# Show top 15 most important features
+
+shap_imp %>%
+  dplyr::slice(1:15) %>%
+  knitr::kable(digits = 4)
+
+```
+
+I also show a SHAP summary plot (bar chart).
+
+```{r}
+
+shap_imp %>% dplyr::slice(1:15) %>%
+  ggplot(aes(reorder(feature, mean_abs_shap), mean_abs_shap)) +
+  geom_col() + coord_flip() + labs(title = "Mean |SHAP| per feature (top 15)", x = "", y = "mean |SHAP|") + theme_minimal()
+
+```
+
+# Classification: Flagging top 10% (high-cost)
+
+I build a binary target and train classifiers to detect members in the top 10% (helpful for targeted interventions).
+
+```{r}
+
+# Prepare classification datasets
+
+train_cl <- train %>% mutate(high_cost_flag = factor(high_cost_flag))
+test_cl  <- test  %>% mutate(high_cost_flag = factor(high_cost_flag))
+
+# Random Forest classifier
+
+rf_cl <- randomForest::randomForest(
+  high_cost_flag ~ . - member_id - employer_id - next_period_cost,
+  data = train_cl,
+  ntree = 300
+)
+
+pred_cl_prob_rf <- predict(rf_cl, newdata = test_cl, type = "prob")[,2]
+pred_cl_rf <- factor(ifelse(pred_cl_prob_rf > 0.5, "1", "0"), levels = c("0","1"))
+
+# XGBoost classifier
+
+X_train_cl <- as.matrix(x_train %>% select(-next_period_cost))
+X_test_cl  <- as.matrix(x_test %>% select(-next_period_cost))
+
+# Use original high_cost_flag as labels
+
+y_train_cl <- as.numeric(train$high_cost_flag)  # 0/1 numeric
+y_test_cl  <- as.numeric(test$high_cost_flag)
+
+# Create DMatrix
+
+dtrain_cl <- xgboost::xgb.DMatrix(data = X_train_cl, label = y_train_cl)
+dtest_cl  <- xgboost::xgb.DMatrix(data = X_test_cl, label = y_test_cl)
+
+# Parameters
+
+params_cl <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.05,
+  max_depth = 6
+)
+
+# Train XGBoost classifier
+
+xgb_cl <- xgboost::xgb.train(
+  params = params_cl,
+  data = dtrain_cl,
+  nrounds = 200,
+  watchlist = list(train = dtrain_cl, eval = dtest_cl),
+  early_stopping_rounds = 20,
+  verbose = 1
+)
+
+# Predictions
+
+pred_cl_prob_xgb <- predict(xgb_cl, dtest_cl)
+pred_cl_xgb <- factor(ifelse(pred_cl_prob_xgb > 0.5, 1, 0), levels = c(0,1))
+
+```
+
+## Classification results
+
+```{r}
+
+roc_rf <- yardstick::roc_auc_vec(truth = test_cl$high_cost_flag, estimate = pred_cl_prob_rf)
+roc_xgb <- yardstick::roc_auc_vec(truth = test_cl$high_cost_flag, estimate = pred_cl_prob_xgb)
+
+prec_rf <- precision_vec(truth = test_cl$high_cost_flag, estimate = pred_cl_rf)
+recall_rf <- recall_vec(truth = test_cl$high_cost_flag, estimate = pred_cl_rf)
+
+prec_xgb <- precision_vec(truth = test_cl$high_cost_flag, estimate = pred_cl_xgb)
+recall_xgb <- recall_vec(truth = test_cl$high_cost_flag, estimate = pred_cl_xgb)
+
+tibble(
+  model = c("rf","xgb"),
+  ROC_AUC = c(roc_rf, roc_xgb),
+  precision = c(prec_rf, prec_xgb),
+  recall = c(recall_rf, recall_xgb)
+) %>% knitr::kable(digits = 3)
+
+```
+
+I also plot an ROC curve for the RF classifier.
+
+```{r}
+
+roc_data <- tibble(
+  truth = as.numeric(as.character(test_cl$high_cost_flag)),
+  rf = pred_cl_prob_rf,
+  xgb = pred_cl_prob_xgb
+)
+
+# A simple ROC plot for RF
+
+library(pROC)
+roc_obj <- pROC::roc(roc_data$truth, roc_data$rf)
+plot(roc_obj, main = "ROC curve - Random Forest (classifier)")
+
+```
+
+**Plain language:** The classifier can meaningfully separate high-cost members from others (AUC well above 0.5). Precision/recall tradeoffs can be tuned depending on whether we prefer fewer false positives (higher precision) or fewer false negatives (higher recall).
+
+# Cohort-level checks and enrichment
+
+I compute the enrichment (how much higher are costs on average among the top predicted group).
+
+```{r}
+
+test_cl$pred_prob_rf <- pred_cl_prob_rf
+top_cohort <- test_cl %>% arrange(desc(pred_prob_rf)) %>% dplyr::slice(1:round(0.1 * nrow(test_cl)))
+enrichment <- mean(top_cohort$next_period_cost) / mean(test_cl$next_period_cost)
+tibble(cohort_size = nrow(top_cohort), overall_n = nrow(test_cl), enrichment = enrichment) %>% knitr::kable(digits = 2)
+
+```
+
+**Plain language:** The top predicted 10% has, on average, `r round(enrichment,2)` times the average cost of the whole test set. This shows value in targeting interventions.
+
+# Save models for reproducibility
+
+```{r}
+
+saveRDS(rf_mod, "../rf_regression_model.rds")
+saveRDS(xgb_mod, "../xgb_regression_model.rds")
+saveRDS(rf_cl, "../rf_classification_model.rds")
+message("Models saved to repo root.")
+
+```

@@ -1,0 +1,176 @@
+
+---
+title: "01 - EDA & Feature Engineering"
+author: "Ife Abe"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width=8, fig.height=5)
+library(tidyverse)
+library(skimr)
+library(GGally)
+library(janitor)
+library(lubridate)
+library(ggplot2)
+source("../scripts/utils.R")
+
+```
+
+# Introduction
+
+In this analysis I explore a synthetic healthcare dataset I generated to study patterns related to future healthcare costs. My goals in this notebook are:
+
+1. Understand the distribution of the target variable (`next_period_cost`).
+2. Inspect relationships between cost and predictors (age, chronic conditions, prior cost).
+3. Create useful features for modeling (log transforms, buckets, interactions).
+4. Save a feature-engineered dataset for modeling.
+
+I explain what I do and why at every step.
+
+# Load data
+
+```{r}
+
+data <- read_data("C:/Users/sirius_ife/Documents/GitHub/healthcare-cost-ml/data/data_raw/synthetic_health_data.csv")
+glimpse(data)
+skimr::skim(data)
+
+```
+
+# 1) Target distribution
+
+I plot the distribution of `next_period_cost`. Healthcare costs are typically right-skewed (a long tail of high-cost members).
+
+```{r}
+
+ggplot(data, aes(x = next_period_cost)) +
+  geom_histogram(bins = 80, fill = "steelblue", alpha = 0.8) +
+  scale_x_log10() +
+  labs(title = "Distribution of next_period_cost (log scale)",
+       x = "next_period_cost (log10)", y = "count") +
+  theme_minimal()
+
+```
+
+**What I observe (non-technical):** Most members have low-to-moderate costs; a smaller group have very high costs. This suggests models need to handle skewness — I'll use both regression (to estimate cost) and classification (to flag high-cost members). note 1E+02 means 1×10^2=100.
+
+# 2) Age and chronic conditions
+
+I examine how age and chronic status relate to future cost.
+
+```{r}
+
+ggplot(data, aes(x = age, y = next_period_cost)) +
+  geom_point(alpha = 0.12, size = 0.8) +
+  geom_smooth(method = "loess", se = TRUE, color = "darkred") +
+  scale_y_log10() +
+  labs(title = "Age vs next_period_cost (smoothed)", x = "Age", y = "next_period_cost (log scale)") +
+  theme_minimal()
+
+```
+
+```{r}
+
+data %>% 
+  group_by(is_chronic) %>% 
+  summarise(mean_cost = mean(next_period_cost),
+            median_cost = median(next_period_cost),
+            n = n()) %>%
+  mutate(pct = n / sum(n)) %>%
+  knitr::kable()
+
+```
+
+**What I observe (non-technical):** People with chronic conditions have substantially higher average costs.
+
+# 3) Pairwise relationships (numeric variables)
+
+I look at pairwise relationships between top numeric predictors and the target to see correlation patterns.
+
+```{r}
+
+nums <- data %>% select(age, previous_visits, telemedicine_visits, prev_year_cost, distinct_providers, num_prescriptions, adherence_index, next_period_cost)
+GGally::ggpairs(log1p(nums), upper = list(continuous = "cor"), lower = list(continuous = "smooth"))
+
+```
+
+**What I observe:** Prior year cost and prior visits show strong association with next period cost.
+
+# 4) Feature engineering
+
+I create several features I expect to be useful:
+
+- `log_prev_cost` and `log_next_cost` to reduce skew.
+- `age_bucket` for non-linear age effects.
+- `chronic_preventive` interaction between chronic status and preventive care.
+- `cost_change_pct` as relative change between prev and next cost (for modeling diagnostics).
+
+```{r}
+
+data_fe <- data %>%
+  mutate(
+    log_prev_cost = log1p(prev_year_cost),
+    log_next_cost = log1p(next_period_cost),
+    age_bucket = case_when(
+      age < 30 ~ "<30",
+      age < 45 ~ "30-44",
+      age < 60 ~ "45-59",
+      TRUE ~ "60+"
+    ),
+    chronic_preventive = case_when(
+      is_chronic == 1 & has_preventive_visit == 1 ~ "chronic_with_preventive",
+      is_chronic == 1 & has_preventive_visit == 0 ~ "chronic_without_preventive",
+      TRUE ~ "no_chronic"
+    ),
+    cost_change_pct = (next_period_cost - prev_year_cost) / pmax(1, prev_year_cost)
+  )
+
+glimpse(data_fe)
+
+```
+
+# 5) Visual checks after transformation
+
+```{r}
+
+ggplot(data_fe, aes(x = log_prev_cost, y = log_next_cost)) +
+  geom_point(alpha = 0.12) +
+  geom_smooth(method = "lm", se = FALSE, color = "darkgreen") +
+  labs(title = "Log(prev_year_cost) vs Log(next_period_cost)", x = "log_prev_cost", y = "log_next_cost") +
+  theme_minimal()
+
+```
+
+```{r}
+
+ggplot(data_fe, aes(x = age_bucket, y = next_period_cost)) +
+  geom_boxplot(outlier.size = 0.5) +
+  scale_y_log10() +
+  labs(title = "Next period cost by age bucket", x = "Age bucket", y = "next_period_cost (log scale)") +
+  theme_minimal()
+
+```
+
+# 6) Missingness and final check
+
+```{r}
+
+data_fe %>% summarise_all(~sum(is.na(.)))
+
+```
+
+There is no missing data in this synthetic dataset. I save the feature-engineered data for the modeling notebook.
+
+```{r}
+
+write_csv(data_fe, "C:/Users/sirius_ife/Documents/GitHub/healthcare-cost-ml/data/data_raw/synthetic_health_data_fe.csv")
+message("Feature-engineered data saved to data_raw/synthetic_health_data_fe.csv")
+
+```
+
+# End of EDA notebook
+
+I now move to modeling: comparing multiple model types for regression (cost prediction) and classification (high-cost flag), tuning where useful, and interpreting results.
