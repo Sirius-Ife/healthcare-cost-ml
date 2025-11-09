@@ -1,4 +1,4 @@
-# Non-technical summary — Healthcare Cost Modeling (my project)
+# Non-technical summary — Healthcare Cost Modeling 
 
 I built a machine-learning project using a realistic synthetic dataset (20,000 records) to predict individual healthcare costs and to identify members likely to be in the top 10% of costs.
 
@@ -24,7 +24,3 @@ I built a machine-learning project using a realistic synthetic dataset (20,000 r
 - Modeling notebook that trains, compares, and interprets models; saves models to disk.
 - Plain language summary that can be shared with non-technical stakeholders.
 
-## Next steps I would take in practice
-- Validate models on real data and add careful fairness and bias checks.
-- Add a retraining pipeline and monitoring (data drift, model drift).
-- Work with clinicians to ensure model-driven interventions are clinically appropriate.
