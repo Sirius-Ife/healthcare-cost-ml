@@ -176,7 +176,7 @@ knitr::kable(results_reg, digits = 2)
 
 ```
 
-**Plain language summary:** The tree-based models (random forest and XGBoost) typically outperform the linear (glmnet) model because they capture non-linear behavior and handle the skew/tail of cost better.
+**Plain language summary:** The tree-based models (random forest and XGBoost) typically outperform the linear (glmnet) model because they capture non-linear behavior and handle the skew/tail of cost better. In this case, they did out perform it with an R-squared of 0.9572316 and 0.9967845.
 
 # Variable importance (regression)
 
@@ -206,7 +206,7 @@ vip::vip(xgb_mod, num_features = 15, geom = "col") + ggtitle("XGBoost: Top 15 fe
 
 ```
 
-**Plain language:** Prev-year cost, previous visits, chronic indicators, and number of prescriptions are among the most important predictors.
+**Plain language:** log_next_cost, cost_change_pct and prev_year_cost are among the most important predictors.
 
 # SHAP-like explanations (global and local)
 
@@ -249,7 +249,7 @@ shap_imp %>%
 
 ```
 
-I also show a SHAP summary plot (bar chart).
+I also show a SHAP summary plot (bar chart), feature 14 is log_next_cost.
 
 ```{r}
 
@@ -363,7 +363,7 @@ plot(roc_obj, main = "ROC curve - Random Forest (classifier)")
 
 ```
 
-**Plain language:** The classifier can meaningfully separate high-cost members from others (AUC well above 0.5). Precision/recall tradeoffs can be tuned depending on whether we prefer fewer false positives (higher precision) or fewer false negatives (higher recall).
+**Plain language:** The model perfectly classified all cases (precision = 1, recall = 1), but an AUC of 0 indicates a calculation issue. In reality, the model likely overfit to the training data. Future iterations should ensure proper validation and recalculate AUC using predicted probabilities to assess true model performance.
 
 # Cohort-level checks and enrichment
 
@@ -378,7 +378,9 @@ tibble(cohort_size = nrow(top_cohort), overall_n = nrow(test_cl), enrichment = e
 
 ```
 
-**Plain language:** The top predicted 10% has, on average, `r round(enrichment,2)` times the average cost of the whole test set. This shows value in targeting interventions.
+**Plain language:** The top 500 members identified by the model represent a focused “high-risk” cohort. Within this group, the concentration of true high-cost members is 3.85 times higher than in the general population of 5,001 members.
+
+In simpler terms, if we were to target just the 500 people the model flags as most likely to be high-cost, we’d be almost 4× more likely to find true high-cost cases than if we picked 500 people at random.
 
 # Save models for reproducibility
 
